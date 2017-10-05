@@ -233,11 +233,10 @@ struct Table {
     /// {C}}` map entry.
     answers: HashMap<CanonicalGoal, DelayedLiteralsSet>,
 
-    /// If true, this table is known to be incomplete -- i.e., there
-    /// may be more answers than the ones in `answers`.. This often
-    /// happens when we pass the overflow limit, but can happen in
-    /// other ways (e.g., in an open-world modality).
-    incomplete: bool,
+    /// These are answers that have not been fully proven because we
+    /// encountered overflow trying to prove them. Obviously they may
+    /// or may not be true. =)
+    overflow_answers: HashSet<CanonicalGoal>,
 
     /// Stack entries waiting to hear about POSITIVE results from this
     /// table. This occurs when you have something like `foo(X) :-
@@ -306,13 +305,13 @@ struct_fold!(ExClause { table_goal, delayed_literals, subgoals });
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Answers {
-    pub incomplete: bool,
     pub answers: Vec<Answer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Answer {
     goal: CanonicalGoal,
+    overflow: bool,
     delayed_literals: Vec<CanonicalGoal>,
 }
 
@@ -423,15 +422,14 @@ impl Forest {
             stack: Stack::default(),
         };
 
-        let (root_table, root_table_depth) = forest.push_new_table(&root_goal, None, None).unwrap();
+        let (root_table, root_table_depth) = forest.push_new_table(&root_goal, None, None);
         let mut minimums = forest.stack[root_table_depth].link;
         let instantiated_goal = forest.infer.instantiate_canonical(&root_goal);
         forest.subgoal(root_table_depth, instantiated_goal, &mut minimums)?;
 
         let mut truth_values = TruthValues::new(&forest.tables);
         let answers = truth_values.simplified_answers(root_table);
-        let incomplete = forest.tables[root_table].incomplete;
-        Ok(Answers { incomplete, answers })
+        Ok(Answers { answers })
     }
 
     /// Pushes a new goal onto the stack, creating a table entry in the process.
@@ -439,31 +437,15 @@ impl Forest {
                       goal: &CanonicalGoal,
                       positive_pending: Option<CanonicalPendingExClause>,
                       negative_pending: Option<CanonicalPendingExClause>)
-                      -> Result<(TableIndex, StackIndex), Overflow> {
-        if self.stack.len() <= self.overflow_depth {
-            let depth = self.stack.next_index();
-            let dfn = self.dfn.next();
-            let table = self.tables.insert(goal, depth);
-            self.tables[table].positives.extend(positive_pending);
-            self.tables[table].negatives.extend(negative_pending);
-            self.stack.push(table, dfn);
-            Ok((table, depth))
-        } else {
-            Err(Overflow)
-        }
-    }
-
-    /// Creates a new table marked as overflow. The table is not
-    /// pushed onto the stack.
-    fn overflow_table(&mut self,
-                      goal: &CanonicalGoal)
-                      -> TableIndex
-    {
+                      -> (TableIndex, StackIndex) {
         let depth = self.stack.next_index();
+        let dfn = self.dfn.next();
         let table = self.tables.insert(goal, depth);
-        self.tables[table].incomplete = true;
-        self.tables[table].depth = None;
-        table
+        debug!("push_new_table: depth {:?} is table {:?} with goal {:?}", depth, table, goal);
+        self.tables[table].positives.extend(positive_pending);
+        self.tables[table].negatives.extend(negative_pending);
+        self.stack.push(table, dfn);
+        (table, depth)
     }
 
     /// Creates an inference snapshot and executes `op`, rolling back
@@ -583,6 +565,11 @@ impl Forest {
                        goal_depth, ex_clause, minimums);
 
         self.snapshotted(|this| {
+            if this.stack.len() > this.overflow_depth {
+                debug!("overflow");
+                return this.overflow_answer(goal_depth, &ex_clause.table_goal);
+            }
+
             match ex_clause.subgoals.pop() {
                 // No goals left to prove: this is an answer.
                 None =>
@@ -615,6 +602,8 @@ impl Forest {
         let canonical_literal: CanonicalGoal =
             self.infer.canonicalize(&selected_goal).quantified;
 
+        debug!("positive: canonical_literal={:?}", canonical_literal);
+
         // Check if we have an existing table for this selected literal.
         let subgoal_table = match self.tables.index_of(&canonical_literal) {
             Some(i) => i,
@@ -624,24 +613,17 @@ impl Forest {
                 let pending_ex_clause = self.pending_ex_clause(goal_depth,
                                                                &ex_clause,
                                                                &selected_goal);
-                match self.push_new_table(&canonical_literal,
-                                          Some(pending_ex_clause),
-                                          None) {
-                    Ok((subgoal_table, subgoal_depth)) => {
-                        let mut subgoal_minimums = self.stack.top().link;
-                        self.subgoal(subgoal_depth, selected_goal, &mut subgoal_minimums)?;
-                        self.update_solution(goal_depth,
-                                             subgoal_table,
-                                             Sign::Positive,
-                                             minimums,
-                                             &mut subgoal_minimums);
-                        return Ok(FullyExplored);
-                    }
-
-                    Err(Overflow) => {
-                        self.overflow_table(&canonical_literal)
-                    }
-                }
+                let (subgoal_table, subgoal_depth) = self.push_new_table(&canonical_literal,
+                                                                         Some(pending_ex_clause),
+                                                                         None);
+                let mut subgoal_minimums = self.stack.top().link;
+                self.subgoal(subgoal_depth, selected_goal, &mut subgoal_minimums)?;
+                self.update_solution(goal_depth,
+                                     subgoal_table,
+                                     Sign::Positive,
+                                     minimums,
+                                     &mut subgoal_minimums);
+                return Ok(FullyExplored);
             }
         };
 
@@ -661,11 +643,18 @@ impl Forest {
             self.update_lookup(goal_depth, subgoal_depth, Sign::Positive, minimums);
         }
 
-        // If we depend on an overflow table, we have to reset our
-        // minimums to be conservative.
-        if self.tables[subgoal_table].incomplete {
-            let goal_table = self.stack[goal_depth].table;
-            self.tables[goal_table].incomplete = true;
+        // First, process the overflow answers.
+        let new_overflows: Vec<_> = {
+            let infer = &mut self.infer;
+            self.tables[subgoal_table]
+                .overflow_answers
+                .iter()
+                .filter_map(|answer| Self::overflow(infer, &ex_clause, &selected_goal, answer).yes())
+                .collect()
+        };
+
+        for new_overflow_answer in new_overflows {
+            self.overflow_answer(goal_depth, &new_overflow_answer)?;
         }
 
         // Next, we will process the answers that have already been
@@ -757,24 +746,17 @@ impl Forest {
                 let pending_ex_clause = self.pending_ex_clause(goal_depth,
                                                                &ex_clause,
                                                                &selected_goal);
-                match self.push_new_table(&canonical_literal,
-                                          None,
-                                          Some(pending_ex_clause)) {
-                    Ok((subgoal_table, subgoal_depth)) => {
-                        let mut subgoal_minimums = self.stack.top().link;
-                        self.subgoal(subgoal_depth, selected_goal, &mut subgoal_minimums)?;
-                        self.update_solution(goal_depth,
-                                             subgoal_table,
-                                             Sign::Negative,
-                                             minimums,
-                                             &mut subgoal_minimums);
-                        return Ok(FullyExplored);
-                    }
-
-                    Err(_) => {
-                        self.overflow_table(&canonical_literal)
-                    }
-                }
+                let (subgoal_table, subgoal_depth) = self.push_new_table(&canonical_literal,
+                                                                         None,
+                                                                         Some(pending_ex_clause));
+                let mut subgoal_minimums = self.stack.top().link;
+                self.subgoal(subgoal_depth, selected_goal, &mut subgoal_minimums)?;
+                self.update_solution(goal_depth,
+                                     subgoal_table,
+                                     Sign::Negative,
+                                     minimums,
+                                     &mut subgoal_minimums);
+                return Ok(FullyExplored);
             }
         };
 
@@ -799,7 +781,10 @@ impl Forest {
         // satisfiable; but there be answers with delayed literals
         // still. If so, we have to delay B ourselves (otherwise, ~B
         // is proven).
-        if self.tables[subgoal_table].incomplete || !self.tables[subgoal_table].answers.is_empty() {
+        if {
+            !self.tables[subgoal_table].overflow_answers.is_empty() ||
+                !self.tables[subgoal_table].answers.is_empty()
+        } {
             ex_clause.delayed_literals.push(selected_goal);
         }
 
@@ -832,10 +817,26 @@ impl Forest {
             "answer(goal_depth={:?}, ex_clause={:?}, minimums={:?})",
             goal_depth, ex_clause, minimums);
 
-        // Produce the canonical form of the answer.
+        let goal_table = self.stack[goal_depth].table;
+
+        // Decompose the answer.
         let ExClause { table_goal, delayed_literals, subgoals } = ex_clause;
         assert!(subgoals.is_empty());
+
+        // Count how many answers this table has so far. If it exceeds
+        // our overflow threshold, then convert this answer into an
+        // OVERFLOW ANSWER. In the case where there are no delayed
+        // literals, this is a bit inaccurate: we *know* that this
+        // answer holds, after all. But converting to an overflow goal
+        // prevents us from propagating across positive links, cutting
+        // off feedback loops that produce more and more answers.
+        if self.tables[goal_table].answers.len() > self.overflow_depth {
+            return self.overflow_answer(goal_depth, &table_goal);
+        }
+
+        // Produce the canonical form of the answer.
         let answer_goal = self.infer.canonicalize(&table_goal).quantified;
+        debug!("answer: goal_table={:?}, answer_goal={:?}", goal_table, answer_goal);
 
         // Convert the `DelayedLiterals` instance representing the set
         // of delayed literals from this ex-clause.
@@ -851,8 +852,6 @@ impl Forest {
         debug!("answer: delayed_literals={:?}", delayed_literals);
 
         // (*) NB: delayed literals cannot have free inference variables
-
-        let goal_table = self.stack[goal_depth].table;
 
         // Determine if answer is new. If so, insert and notify.
         let list: Vec<_> = if delayed_literals.delayed_literals.is_empty() {
@@ -931,6 +930,52 @@ impl Forest {
         // Process each of them in turn.
         for (pending_table, pending_ex_clause) in list {
             self.new_clause(pending_table, pending_ex_clause, minimums)?;
+        }
+
+        Ok(FullyExplored)
+    }
+
+    fn overflow_answer(&mut self,
+                       goal_depth: StackIndex,
+                       overflow_goal: &InEnvironment<Goal>)
+                       -> ExplorationResult
+    {
+        debug_heading!(
+            "overflow_answer(goal_depth={:?}, overflow_goal{:?})",
+            goal_depth, overflow_goal);
+
+        let answer_goal = self.infer.canonicalize(&overflow_goal).quantified;
+        let goal_table = self.stack[goal_depth].table;
+
+        debug!("overflow_answer: answer_goal = {:?}", answer_goal);
+
+        if !self.tables[goal_table].overflow_answers.insert(answer_goal.clone()) {
+            // we've already seen this overflow answer
+            return Ok(FullyExplored);
+        }
+
+        // Push the overflow answer to our positive dependents,
+        // creating follow-on overflow answers.
+
+        // Clear out all the people waiting for negative results; we
+        // have an overflow answer now, so they will never be fully
+        // resolved (we will wind up as a delayed literal for them).
+        self.tables[goal_table].negatives = vec![];
+
+        let new_overflow_answers: Vec<_> = {
+            let infer = &mut self.infer;
+            self.tables[goal_table]
+                .positives
+                .iter()
+                .filter_map(|p| {
+                    debug!("overflow_answer: positive = {:?}", answer_goal);
+                    Self::overflow_pending(infer, p, &answer_goal).yes()
+                })
+                .collect()
+        };
+
+        for (new_table, new_overflow_answer) in new_overflow_answers {
+            self.overflow_answer(new_table, &new_overflow_answer)?;
         }
 
         Ok(FullyExplored)
@@ -1229,7 +1274,7 @@ impl Forest {
     //
     // Let C be an X-clause with no delayed literals. Let
     //
-    //     C' = A' :- L'1...L'n
+    //     C' = A' :- L'1...L'm
     //
     // be a variant of C such that G and C' have no variables in
     // common.
@@ -1238,7 +1283,7 @@ impl Forest {
     //
     // Then:
     //
-    //     S(A :- D | L1...Li-1, L1'...Lm', Li+1...Ln)
+    //     S(A :- D | L1...Li-1, L1'...L'm, Li+1...Ln)
     //
     // is the SLG resolvent of G with C.
 
@@ -1440,6 +1485,15 @@ impl Forest {
                     let domain_goal = domain_goal.cast();
                     literals.push(Literal::Positive(InEnvironment::new(&environment, domain_goal)));
                 }
+                Goal::CannotProve(()) => {
+                    // You can think of `CannotProve` as a special
+                    // goal that is only provable if `not {
+                    // CannotProve }`. Trying to prove this, of
+                    // course, will always create a negative cycle and
+                    // hence a delayed literal that cannot be
+                    // resolved.
+                    literals.push(Literal::Negative(InEnvironment::new(&environment, goal)));
+                }
             }
         }
 
@@ -1526,6 +1580,144 @@ impl Forest {
 
         Satisfiable::Yes(ex_clause)
     }
+
+    ///////////////////////////////////////////////////////////////////////////
+    // OVERFLOW
+    //
+    // An "overflow answer" `X :- <overflow>` indicates that the goal
+    // X could not be fully evaluated because it overflowed -- it may
+    // be true, false, or unknown. This result propagates winds up
+    // propagating upwards to all things that have positive
+    // dependencies on X (things with negative dependencies will wind
+    // up indefinitely delayed).
+    //
+    // The "SLG Overflow" is something we invented, analogous to SLG
+    // Resolvent and SLG Factor, to describe how an overflow result
+    // for some subgoal is combined with the overall goal to yield a
+    // new answer. It however works rather differently from those
+    // measures.  In particular, the most *analagous* thing to do
+    // would be to take the overflow answer and unify it with the
+    // selected goal for a pending result. That approach, however,
+    // leads to infinite sets of answers in overflow scenarios.
+    //
+    // So our definition instead is like this. Given a (pending) X-clause
+    //
+    //     // A :- L0..Li-1, Li, Li+1..Ln
+    //
+    // and an overflow answer
+    //
+    //     // C
+    //
+    // where:
+    //
+    // - C and Li have no variables in common; and
+    // - Li and C unify with subst S
+    //
+    // we yield the overflow answer A (note: not `S(A)`).
+    //
+    // Let's work through how overflow propoagates with an example,
+    // which will also demonstrate why we don't yield up `S(A)`:
+    //
+    //     // Foo(S<?A>) :- Foo(?A), WF(Foo(?A)).
+    //
+    // and the query `Foo(?T)`. This will wind up with a table like:
+    //
+    //     // Foo(?T) :- Foo(?T)
+    //     //        |
+    //     // Foo(S<?U>) :- Foo(?U), WF(Foo(?U)).
+    //
+    // processing the subgoal `Foo(?U)` will create a positive,
+    // recursive link (1). The pending ex-clause would be:
+    //
+    //     // forall<?U> { Foo(S<?U>) :- Foo(?U), WF(Foo(?U)) }
+    //
+    // where `Foo(?U)` is the selected literal.
+    //
+    // Next we process `WF(Foo(?U))` -- that will push a new table:
+    //
+    //     // WF(Foo(?U)) :- WF(Foo(?U))
+    //
+    // with a positive link (2) to:
+    //
+    //     // forall<?U> { Foo(S<?U>) :- WF(Foo(?U)) }
+    //
+    // Now -- let's say -- we trip the overflow counter. Then we will
+    // produce an overflow answer `WF(Foo(?U)) :- overflow`. This is
+    // propagated along the positive link (2) to produce:
+    //
+    //     // Foo(S<?U>) :- overflow
+    //
+    // Now we go to propagate this result along positive link
+    // (1). This is where it gets interesting. If we instantiate and
+    // unify the selected literal `Foo(?V)` with the overflow answer
+    // `Foo(S<?U>)`, we get the substitution:
+    //
+    //     // S = [?V => S<?U>]
+    //
+    // If we apply that to the overflow answer `A = Foo(S<?V>)`, we would get
+    // `Foo(S<S<?U>>)` -- and you can see then that it is growing.
+    //
+    // Instead, we do *not* apply the substitution, and so we get
+    // `Foo(S<?V>)`.
+
+    fn overflow_pending(infer: &mut InferenceTable,
+                        pending_ex_clause: &CanonicalPendingExClause,
+                        answer_goal: &CanonicalGoal)
+                        -> Satisfiable<(StackIndex, InEnvironment<Goal>)>
+    {
+        let PendingExClause {
+            goal_depth,
+            table_goal,
+            selected_goal, // <-- Li
+            delayed_literals,
+            subgoals,
+        } = infer.instantiate_canonical(pending_ex_clause);
+
+        let ex_clause = ExClause {
+            table_goal,
+            delayed_literals,
+            subgoals,
+        };
+
+        Self::overflow(infer, &ex_clause, &selected_goal, answer_goal)
+            .map(|a| (goal_depth, a))
+    }
+
+    fn overflow(infer: &mut InferenceTable,
+                ex_clause: &ExClause,
+                selected_goal: &InEnvironment<Goal>,
+                overflow_answer: &CanonicalGoal)
+                -> Satisfiable<InEnvironment<Goal>>
+    {
+        debug!("overflow(ex_clause={:?}, selected_goal={:?}, overflow_answer={:?})",
+               ex_clause, selected_goal, overflow_answer);
+
+        let snapshot = infer.snapshot();
+
+        {
+            // Once instantiated, `overflow_answer` is C in the description
+            // above. No variables in commmon with Li.
+            let overflow_answer = infer.instantiate_canonical(&overflow_answer);
+
+            // Unify the selected literal Li with C.
+            let UnificationResult { goals, constraints } = {
+                match infer.unify(&selected_goal.environment, selected_goal, &overflow_answer) {
+                    Err(_) => return Satisfiable::No,
+                    Ok(v) => v,
+                }
+            };
+
+            // We are producing an OVERFLOW ANSWER, which already may or
+            // may not hold, so we don't really care about the subgoals
+            // and things.
+            mem::drop(constraints);
+            mem::drop(goals);
+        }
+
+        infer.rollback_to(snapshot);
+
+        Satisfiable::Yes(ex_clause.table_goal.clone())
+    }
 }
 
 impl Stack {
@@ -1594,7 +1786,7 @@ impl Tables {
         let index = self.next_index();
         self.tables.push(Table {
             answers: HashMap::new(),
-            incomplete: false,
+            overflow_answers: HashSet::new(),
             positives: vec![],
             negatives: vec![],
             depth: Some(depth),
@@ -1632,6 +1824,17 @@ impl<'a> IntoIterator for &'a mut Tables {
 }
 
 impl Table {
+    /// Counts the total number of answers in this table. Note that a
+    /// single entry in the `answers` map may contain multiple
+    /// answers. This is used for overflow detection to see if there
+    /// are too many answers in a particular table.
+    fn count_answers(&self) -> usize {
+        self.answers
+            .iter()
+            .map(|(_, delayed_literals_set)| delayed_literals_set.len())
+            .sum()
+    }
+
     /// Marks this table as completely evaluated. In the process,
     /// returns the list of pending negative clauses, since those can
     /// possibly now be updated (either to mark them as SUCCESSFUL or
@@ -1653,7 +1856,7 @@ impl Table {
     /// True if this table has at least one solution without a delayed
     /// literal.
     fn is_satisfiable(&self) -> bool {
-        !self.incomplete &&
+        self.overflow_answers.is_empty() &&
             self.answers
                 .values()
                 .any(|delayed_literals| delayed_literals.is_empty())
@@ -1667,22 +1870,39 @@ impl Table {
     /// Flatten out the answers stored in this table into a set of
     /// (GOAL, DELAYED-LITERAL) pairs.
     fn flat_answers(&self) -> Vec<Answer> {
-        self.answers
-            .iter()
-            .flat_map(|(goal, delayed_literals)| {
-                delayed_literals.clone()
-                                .into_set()
-                                .into_iter()
-                                .map(move |delayed_literals_set| Answer {
-                                    goal: goal.clone(),
-                                    delayed_literals: delayed_literals_set.delayed_literals.clone(),
-                                })
-            })
-            .collect()
+        let true_answers =
+            self.answers
+                .iter()
+                .flat_map(|(goal, delayed_literals)| {
+                    delayed_literals.clone()
+                                    .into_set()
+                                    .into_iter()
+                                    .map(move |dl| Answer {
+                                        goal: goal.clone(),
+                                        overflow: false,
+                                        delayed_literals: dl.delayed_literals.clone(),
+                                    })
+                });
+
+        let overflow_answers =
+            self.overflow_answers
+                .iter()
+                .cloned()
+                .map(|goal| Answer { goal, overflow: true, delayed_literals: vec![] });
+
+        true_answers.chain(overflow_answers).collect()
     }
 }
 
 impl DelayedLiteralsSet {
+    /// Number of distinct `DelayedLiterals` values represented here.
+    fn len(&self) -> usize {
+        match *self {
+            DelayedLiteralsSet::None => 1,
+            DelayedLiteralsSet::Some(ref set) => set.len(),
+        }
+    }
+
     fn is_empty(&self) -> bool {
         match *self {
             DelayedLiteralsSet::None => true,
@@ -1820,22 +2040,13 @@ impl<'a> TruthValues<'a> {
         // they are considered unknown results.
         self.truth_values[table.value] = Some(TruthValue::Unknown);
 
-        // If the table had a positive link on an overflow table, then
-        // there could be arbitrary number of additional results.
-        let incomplete = if self.tables[table].incomplete {
-            TruthValue::Unknown
-        } else {
-            TruthValue::False
-        };
-
         // Compute result. A table is true if any of its answers are true.
         let truth_value =
             TruthValue::any(
                 self.tables[table]
                     .flat_answers()
                     .into_iter()
-                    .map(|answer| self.eval_answer(&answer)))
-            .or(incomplete);
+                    .map(|answer| self.eval_answer(&answer)));
 
         // Update table.
         self.truth_values[table.value] = Some(truth_value);
@@ -1845,10 +2056,17 @@ impl<'a> TruthValues<'a> {
 
     fn eval_answer(&mut self, answer: &Answer) -> TruthValue
     {
+        let is_overflow = if answer.overflow {
+            TruthValue::Unknown
+        } else {
+            TruthValue::True
+        };
+
         TruthValue::all(
             answer.delayed_literals
                 .iter()
                 .map(|dl| self.eval_goal(dl).not()))
+            .and(is_overflow)
     }
 }
 
