@@ -39,6 +39,8 @@ use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use zip::Zip;
 
+mod truncate;
+
 pub fn solve_repl(overflow_depth: usize,
                   program: &Arc<ProgramEnvironment>,
                   goal: Goal)

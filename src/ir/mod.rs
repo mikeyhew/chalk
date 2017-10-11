@@ -5,6 +5,8 @@ use solve::infer::{TyInferenceVariable, LifetimeInferenceVariable};
 use std::collections::{HashSet, HashMap, BTreeMap};
 use std::sync::Arc;
 
+#[macro_use] mod macros;
+
 pub mod could_match;
 
 pub type Identifier = InternedString;
