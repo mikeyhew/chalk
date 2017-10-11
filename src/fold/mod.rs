@@ -279,10 +279,10 @@ impl Fold for Lifetime {
     }
 }
 
-fn super_fold_lifetime(folder: &mut Folder,
-                       lifetime: &Lifetime,
-                       binders: usize)
-                       -> Result<Lifetime>
+pub fn super_fold_lifetime(folder: &mut Folder,
+                           lifetime: &Lifetime,
+                           binders: usize)
+                           -> Result<Lifetime>
 {
     match *lifetime {
         Lifetime::Var(depth) => if depth >= binders {
